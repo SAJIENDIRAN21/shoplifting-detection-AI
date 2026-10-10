@@ -1,8 +1,0 @@
-ultralytics
-torch
-torchvision
-opencv-python
-numpy
-requests
-scikit-learn
-matplotlib
