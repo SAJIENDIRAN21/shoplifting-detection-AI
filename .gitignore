@@ -1,0 +1,7 @@
+﻿*.mp4
+*.avi
+*.pth
+*.pt
+evidence/
+__pycache__/
+runs/
