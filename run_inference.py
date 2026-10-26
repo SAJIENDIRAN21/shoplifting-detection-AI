@@ -1,19 +1,36 @@
 """
-Real-time CCTV Shoplifting Prevention Inference Engine (Production Grade)
-- Dual Model: YOLOv8-Pose (ByteTrack) + YOLOv8n Retail Item Detector
-- Bi-LSTM kinematic anomaly scoring (30-frame history), smoothed with a 10-frame EMA
-- Skeletal-rotation gate: while the shoulders rotate, an invisible item is SELF-OCCLUSION, not concealment
-- Concealment = verified hold + item gone + DOWNWARD wrist entry into the waist zone + >= 12-frame dwell
-- Theft confirmation = concealment AND smoothed Bi-LSTM score > 0.70
-- Proximity handoff (<= 70 px wrist contact for >= 3 frames) transfers the held item A -> B immediately
-- Linked suspicion: whoever conceals is PRIMARY THIEF, the close-interaction partner is ACCOMPLICE
-- Complete Incident Capture: Pre-Roll (~3s) + Post-Roll (~4s) MP4 Video
-- High-Resolution Forensic Image Dossier (Full Scene Context + Best Frame Profile)
+Real-time CCTV Shoplifting Detection & Behavioral Analytics Engine
+==================================================================
+Standalone, pose-only. Dependencies: ultralytics (brings torch), opencv-python, numpy.
+
+Two-Tier Intelligence System
+  Tier 1  WARNING  : hands linger in the waist / pocket / torso zone for > 25 frames
+                     BROWSING -> SUSPICIOUS (orange) + warning log
+  Tier 2  THEFT    : the same behaviour persists / escalates to > 60 frames
+                     SUSPICIOUS -> THEFT (red) + alarm print + forensic export to evidence/
+                     (full-scene snapshot with the suspect boxed + upscaled suspect crop)
+
+Why it does not depend on the item detector
+  Items are never detected, so unknown grocery / snack items cannot be missed. The decision rests on
+  skeletal kinematics: hand-to-torso proximity, a bent-arm / centre-line gesture test (arms hanging
+  straight at the sides do not count), a recent reach toward the shelf, and dwell time.
+
+Top-down / ceiling CCTV robustness
+  The waist is never "unavailable". It is estimated from, in order of reliability:
+    KPT  (hips + shoulders)  ->  HIP (hips only)  ->  SHOULDER (shoulders only)  ->  BOX (bbox ratios)
+  and smoothed in box-relative coordinates, so switching source never makes the zone jump or the
+  dwell timer break. Wrist keypoints that drop out are remembered for a few frames, and the dwell
+  timer decays instead of resetting to zero.
+
+Customer identity
+  ByteTrack (or BoT-SORT) raw track IDs are mapped onto permanent "Customer N" IDs. A raw ID must
+  survive a few frames to become a customer, and a lost customer is re-linked to a new track using
+  motion-predicted position, size and a clothing-colour histogram.
 """
 
 import argparse
+import os
 import sys
-import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,898 +39,724 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import torch
 from ultralytics import YOLO
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
 
-# ----------------- Tunable Constants -----------------
-RETAIL_CLASSES = {"bottle", "cup", "cell phone"}
+# ----------------------------------------------------------------------------------------------
+# Tunable constants
+# ----------------------------------------------------------------------------------------------
+# --- tiers (frames) ---
+WARN_FRAMES = 25          # dwell > this  -> SUSPICIOUS (Tier 1)
+THEFT_FRAMES = 60         # dwell > this  -> THEFT      (Tier 2)
+RELEASE_DWELL = 10        # a SUSPICIOUS customer returns to BROWSING once dwell decays to this
+DWELL_GAP_TOL = 3         # frames the hands may leave the zone before the dwell starts to decay
+DWELL_DECAY = 2           # dwell lost per frame once the hands are out of the zone
 
-KP_CONF = 0.35            # Normal keypoint confidence gate
-ZONE_KP_CONF = 0.20       # Looser gate for wrists near/inside pockets (pose conf drops when occluded)
-L_SHOULDER, R_SHOULDER, L_WRIST, R_WRIST, L_HIP, R_HIP = 5, 6, 9, 10, 11, 12
+# --- keypoint confidences ---
+HIP_CONF = 0.30
+SHOULDER_CONF = 0.30
+WRIST_CONF = 0.25
+ELBOW_CONF = 0.25
+WRIST_GRACE_FRAMES = 6    # a wrist that drops out keeps its last (waist-relative) position this long
 
-# --- Bi-LSTM ---
-HISTORY_LEN = 30          # Bi-LSTM sequence length
-SCORE_STRIDE = 2          # Run the Bi-LSTM every N frames (scores are cached in between)
-EMA_SPAN_FRAMES = 10      # EMA span measured in video frames
-EMA_ALPHA = 2.0 / (EMA_SPAN_FRAMES / SCORE_STRIDE + 1.0)   # per scoring update
-AI_THEFT_SCORE = 0.70     # Smoothed score required (together with the physical dwell) for THEFT
+# --- waist / torso zone, in torso lengths relative to the (smoothed) waist centre ---
+ZONE_HALF_W = 0.80
+ZONE_TOP = -0.55          # includes the lower chest / stomach ("torso zone")
+ZONE_BOTTOM = 0.65        # includes the pocket line
+CENTER_DX = 0.40          # a hand this close to the body centre-line always counts (stomach / waistband)
+ARM_STRAIGHT_DEG = 150.0  # elbow angle above this = arm hanging straight = NOT a concealment gesture
+UNKNOWN_ELBOW_DX = 0.55   # when the elbow is not visible only hands this close to the body count
+WAIST_EMA = 0.40          # smoothing of the waist estimate (box-relative)
 
-# --- Item possession ---
-HOLD_MIN_FRAMES = 8       # Sustained wrist/item proximity -> HOLDING
-HOLD_GRACE_FRAMES = 10    # Detector dropout tolerated before an un-armed hold counter decays
-MISSING_MIN_FRAMES = 5    # Item must be gone this long (outside rotation) before concealment counts
-RELEASE_MISSING_FRAMES = 200  # Item gone this long (~10 s) with no concealment -> disarm
-HAND_ITEM_FRAC = 0.10     # Wrist-to-item-box distance threshold as fraction of person height
-HAND_ITEM_MIN_PX = 20.0
+# --- shelf-reach gate (a concealment is preceded by reaching toward the shelf) ---
+REACH_DIST = 1.40         # wrist farther than this (torso lengths) from the waist = arm extended
+REACH_UP = -1.10          # ... or above the shoulder line
+ENGAGE_WINDOW = 200       # frames after a reach during which waist dwell is suspicious (~10 s)
 
-# --- Waist / pocket zone (in torso-length units, relative to hip midpoint) ---
-ZONE_HALF_W = 0.75
-ZONE_TOP = -0.25
-ZONE_BOTTOM = 0.60
-
-# --- Downward entry + dwell ---
-DESC_WINDOW = 10          # Frames of wrist history inspected for a downward move
-DESC_MIN_DROP = 0.12      # Wrist must have dropped at least this many torso-lengths into the zone
-DESC_NO_RISE = 0.01       # ...and must not currently be moving back up
-DWELL_FRAMES = 12         # Frames the wrist must stay in the zone after the downward entry
-DWELL_GAP_TOL = 3         # Keypoint flicker tolerated inside a dwell
-
-# --- Skeletal rotation (self-occlusion) ---
-ROT_ENTER = 0.50          # shoulder aspect ratio below this => rotating (CLI: --rot-enter)
-ROT_EXIT_MARGIN = 0.10    # hysteresis: must exceed ROT_ENTER + margin to start clearing
-ROT_GRACE_FRAMES = 12     # keep treating item loss as self-occlusion this long after rotation ends
-ROT_EMA = 0.5             # smoothing of the raw shoulder ratio
-
-# --- Proximity handoff / linked suspicion ---
-HANDOFF_PROX_PX = 70.0            # wrist-to-wrist distance (CLI: --prox-px)
-HANDOFF_CONTACT_FRAMES = 3        # consecutive close frames (gap tolerant)
-HANDOFF_CONTACT_GAP_TOL = 1
-HANDOFF_WINDOW = 6                # loss must occur during contact or within this many frames after it
-HANDOFF_LOST_MIN_FRAMES = 2       # giver's item must be undetected this long
-HANDOFF_PRE_MARGIN = 10           # item must have been seen no earlier than this before contact began
-HANDOFF_COOLDOWN = 30             # no repeat transfer on the same pair
-INTERACTION_LINK_FRAMES = 300     # partner link stays valid this long (~15 s)
-
-PRE_ROLL_FRAMES = 60
-POST_ROLL_FRAMES = 80
-STATE_TTL_FRAMES = 90             # Drop state of people not seen for this long
+# --- customer identity layer ---
+TRACK_BUFFER = 90
+CONFIRM_FRAMES = 3        # a raw track must live this long before it becomes a customer
+PENDING_TTL = 5
+DUP_IOU = 0.70            # an unconfirmed track on top of a known customer is a duplicate detection
+REID_MAX_LOST_FRAMES = 240
+REID_APP_MAX = 0.55       # max clothing-histogram distance for a re-link (0 = identical)
+REID_BASE_DIST = 0.60     # allowed jump in person-heights right after loss ...
+REID_DIST_GROWTH = 0.04   # ... growing per lost frame ...
+REID_DIST_CAP = 3.5       # ... up to this cap
+REID_NO_APP_DIST = 0.80
+REID_MAX_SIZE_RATIO = 2.5
+EXTRAP_MAX_FRAMES = 30
+RETAIN_LOST_FRAMES = 300  # forget non-suspect customers unseen this long
+APP_UPDATE_ALPHA = 0.10
+APP_OVERLAP_IOU = 0.15
 
 NEVER = -10 ** 9
 
-# BGR colors
+# BGR colours
 COLOR_GREEN = (0, 255, 0)
-COLOR_YELLOW = (0, 255, 255)
 COLOR_ORANGE = (0, 165, 255)
 COLOR_RED = (0, 0, 255)
+COLOR_MAGENTA = (255, 0, 255)
 
-FSM_STYLE = {
-    "BROWSING": (COLOR_GREEN, "Browsing (Clear)"),
-    "HOLDING": (COLOR_YELLOW, "Holding Item"),
-    "SUSPICIOUS": (COLOR_ORANGE, "Suspicious Motion"),
-    "THEFT": (COLOR_RED, ""),
+STATE_COLOR = {"BROWSING": COLOR_GREEN, "SUSPICIOUS": COLOR_ORANGE, "THEFT": COLOR_RED}
+
+# COCO-17 keypoints: (wrist, elbow, shoulder) per arm
+ARMS = ((9, 7, 5), (10, 8, 6))
+L_SHOULDER, R_SHOULDER, L_HIP, R_HIP = 5, 6, 11, 12
+SKELETON = [(5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12), (11, 12),
+            (11, 13), (13, 15), (12, 14), (14, 16), (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6)]
+
+# Tracker configs, written to trackers/<name>_retail.yaml (long buffer, permissive thresholds for 360p CCTV)
+TRACKER_CFGS = {
+    "bytetrack": {
+        "tracker_type": "bytetrack",
+        "track_high_thresh": 0.25,
+        "track_low_thresh": 0.10,
+        "new_track_thresh": 0.25,
+        "track_buffer": TRACK_BUFFER,
+        "match_thresh": 0.80,
+        "fuse_score": True,
+    },
+    "botsort": {
+        "tracker_type": "botsort",
+        "track_high_thresh": 0.25,
+        "track_low_thresh": 0.10,
+        "new_track_thresh": 0.25,
+        "track_buffer": TRACK_BUFFER,
+        "match_thresh": 0.80,
+        "fuse_score": True,
+        "gmc_method": "sparseOptFlow",
+        "proximity_thresh": 0.50,
+        "appearance_thresh": 0.25,
+        "with_reid": False,
+        "model": "auto",
+    },
 }
-
-TORSO_PAIRS = [(5, 6), (5, 11), (6, 12), (11, 12), (5, 7), (7, 9), (6, 8), (8, 10)]
-
-NORM_MODES = ("hip", "hipbox", "box", "frame")
 
 
 @dataclass
 class Params:
-    rot_enter: float = ROT_ENTER
-    prox_px: float = HANDOFF_PROX_PX
-    ai_gate: bool = True
+    warn_frames: int = WARN_FRAMES
+    theft_frames: int = THEFT_FRAMES
+    reach_gate: bool = True
 
 
-# ----------------- Background Forensic Evidence Savers -----------------
-def write_video_worker(frames, output_path, fps=20.0):
-    if not frames:
-        return
-    h, w = frames[0].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
-    for f in frames:
-        out.write(f)
-    out.release()
-    print(f"\n[EVIDENCE LOGGED] Complete incident clip saved: {output_path.name}")
-
-
-def write_dossier_worker(scene_frame, suspect_box, tid, role_name, evidence_dir):
-    try:
-        h, w = scene_frame.shape[:2]
-        bx1, by1, bx2, by2 = suspect_box.astype(int)
-        bx1, by1 = max(0, bx1), max(0, by1)
-        bx2, by2 = min(w, bx2), min(h, by2)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        role_slug = "primary_thief" if "PRIMARY" in role_name else "accomplice"
-
-        # 1. Full High-Res Scene Context (with red targeting rectangle)
-        context_img = scene_frame.copy()
-        cv2.rectangle(context_img, (bx1, by1), (bx2, by2), (0, 0, 255), 3)
-        cv2.putText(
-            context_img,
-            f"SUSPECT ID: {tid} ({role_name})",
-            (bx1, max(by1 - 12, 25)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 0, 255),
-            2
-        )
-        context_path = evidence_dir / f"suspect_{role_slug}_id_{tid}_{ts}_FULL_SCENE.jpg"
-        cv2.imwrite(str(context_path), context_img)
-
-        # 2. Enhanced Upper-Body / Profile Crop
-        pad_x = int((bx2 - bx1) * 0.12)
-        pad_y = int((by2 - by1) * 0.08)
-        cx1 = max(0, bx1 - pad_x)
-        cy1 = max(0, by1 - pad_y)
-        cx2 = min(w, bx2 + pad_x)
-        cy2 = min(h, int(by1 + (by2 - by1) * 0.50))
-
-        crop = scene_frame[cy1:cy2, cx1:cx2]
-        if crop.shape[0] > 20 and crop.shape[1] > 20:
-            # 2x Bicubic Upscale for Forensics
-            crop_upscaled = cv2.resize(crop, (crop.shape[1] * 2, crop.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-            profile_path = evidence_dir / f"suspect_{role_slug}_id_{tid}_{ts}_PROFILE.jpg"
-            cv2.imwrite(str(profile_path), crop_upscaled)
-
-        print(f"[DOSSIER LOGGED] High-res evidence stored for ID {tid} ({role_slug})")
-    except Exception as e:
-        print(f"[WARNING] Dossier export failure: {e}")
-
-
-class IncidentRecorder:
-    """Pre-roll + post-roll video capture and best-frame suspect dossiers."""
-
-    def __init__(self, evidence_dir: Path, fps: float):
-        self.evidence_dir = evidence_dir
-        self.fps = fps
-        self.active = False
-        self.frames_left = 0
-        self.buffer: List[np.ndarray] = []
-        self.ts = ""
-        self.suspects = set()
-        self.best: Dict[int, dict] = {}
-
-    def start(self, rolling_buffer):
-        if self.active:
-            return
-        self.active = True
-        self.frames_left = POST_ROLL_FRAMES
-        self.ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.buffer = list(rolling_buffer)
-
-    def add_suspect(self, tid: int):
-        self.suspects.add(tid)
-
-    def feed(self, frame):
-        if self.active:
-            self.buffer.append(frame.copy())
-            self.frames_left -= 1
-
-    def update(self, frame, persons, states):
-        if not self.active:
-            return
-        for s_id in self.suspects:
-            if s_id in persons:
-                s_kpts = persons[s_id]["kpts"]
-                face_conf = float(np.mean([s_kpts[i][2] for i in range(5)]))
-                prev = self.best.get(s_id)
-                if prev is None or face_conf > prev["conf"]:
-                    self.best[s_id] = {
-                        "frame": frame.copy(),
-                        "box": persons[s_id]["box"].copy(),
-                        "conf": face_conf,
-                        "role": states[s_id].role,
-                    }
-        if self.frames_left <= 0:
-            self.finish()
-
-    def finish(self):
-        if not self.active:
-            return
-        vid_path = self.evidence_dir / f"retail_theft_incident_{self.ts}.mp4"
-        threading.Thread(
-            target=write_video_worker, args=(self.buffer, vid_path, self.fps), daemon=True
-        ).start()
-        for s_id, data in self.best.items():
-            threading.Thread(
-                target=write_dossier_worker,
-                args=(data["frame"], data["box"], s_id, data["role"], self.evidence_dir),
-                daemon=True
-            ).start()
-        self.active = False
-        self.frames_left = 0
-        self.buffer = []
-        self.suspects = set()
-        self.best = {}
-
-
-# ----------------- Geometry Helpers -----------------
+# ----------------------------------------------------------------------------------------------
+# Geometry helpers
+# ----------------------------------------------------------------------------------------------
 def box_height(box: np.ndarray) -> float:
     return max(float(box[3] - box[1]), 1.0)
 
 
-def torso_geometry(kpts: np.ndarray, box: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Hip midpoint and torso length (shoulder-mid to hip-mid), with box-based fallbacks."""
-    box_h = box_height(box)
-
-    hips = [kpts[i][:2] for i in (L_HIP, R_HIP) if kpts[i][2] > KP_CONF]
-    if hips:
-        hip_mid = np.mean(hips, axis=0)
-    else:
-        hip_mid = np.array([(box[0] + box[2]) / 2.0, box[1] + box_h * 0.58])
-
-    shoulders = [kpts[i][:2] for i in (L_SHOULDER, R_SHOULDER) if kpts[i][2] > KP_CONF]
-    if shoulders:
-        torso = float(np.linalg.norm(np.mean(shoulders, axis=0) - hip_mid))
-    else:
-        torso = 0.30 * box_h
-    torso = max(torso, 0.15 * box_h)
-    return hip_mid.astype(np.float32), torso
+def box_center(box: np.ndarray) -> np.ndarray:
+    return np.array([(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0], dtype=np.float32)
 
 
-def normalize_keypoints(kpts: np.ndarray, box: np.ndarray, frame_wh: Tuple[int, int],
-                        mode: str = "box") -> np.ndarray:
+def iou(a: np.ndarray, b: np.ndarray) -> float:
+    ix1, iy1 = max(float(a[0]), float(b[0])), max(float(a[1]), float(b[1]))
+    ix2, iy2 = min(float(a[2]), float(b[2])), min(float(a[3]), float(b[3]))
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, float(a[2] - a[0])) * max(0.0, float(a[3] - a[1]))
+    area_b = max(0.0, float(b[2] - b[0])) * max(0.0, float(b[3] - b[1]))
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Angle at vertex b (degrees) between segments b->a and b->c."""
+    v1, v2 = a - b, c - b
+    n = float(np.linalg.norm(v1) * np.linalg.norm(v2))
+    if n < 1e-6:
+        return 180.0
+    return float(np.degrees(np.arccos(np.clip(float(np.dot(v1, v2)) / n, -1.0, 1.0))))
+
+
+def estimate_waist(kpts: np.ndarray, box: np.ndarray) -> Tuple[np.ndarray, float, str]:
     """
-    (17, 3) -> (51,) feature vector [x0, y0, c0, x1, y1, c1, ...].
-    The (x, y) normalization must match what best_bilstm.pth was trained on:
-      box    : (xy - box_top_left) / (box_w, box_h)          -> roughly [0, 1]   (default)
-      hip    : (xy - hip_mid) / torso_length, clipped to [-5, 5]
-      hipbox : (xy - hip_mid) / box_height
-      frame  : xy / (frame_w, frame_h)                       -> [0, 1]
-    Confidence is passed through unchanged.
+    Waist centre (pixels), torso length (pixels) and the source used. NEVER returns None, so the
+    zone and the dwell timer survive hips hidden by a ceiling-mounted camera angle.
+
+      KPT      hips + shoulders       exact torso length
+      HIP      hips only              torso length from the box (0.30 * height)
+      SHOULDER shoulders only         waist = shoulder-mid + one box-estimated torso length down
+      BOX      nothing usable         waist at 55 % of the box height, centred
     """
-    xy_raw = kpts[:, :2]
-    if mode == "frame":
-        xy = xy_raw / np.array([max(frame_wh[0], 1), max(frame_wh[1], 1)], dtype=np.float32)
-    elif mode == "box":
-        bw = max(float(box[2] - box[0]), 1.0)
-        bh = box_height(box)
-        xy = (xy_raw - np.array([box[0], box[1]], dtype=np.float32)) / np.array([bw, bh], dtype=np.float32)
-    elif mode == "hipbox":
-        hip_mid, _ = torso_geometry(kpts, box)
-        xy = (xy_raw - hip_mid) / box_height(box)
-    else:  # "hip"
-        hip_mid, torso = torso_geometry(kpts, box)
-        xy = np.clip((xy_raw - hip_mid) / torso, -5.0, 5.0)
-    out = np.concatenate([xy, kpts[:, 2:3]], axis=1)
-    return out.reshape(-1).astype(np.float32)
+    h = box_height(box)
+    cx = (float(box[0]) + float(box[2])) / 2.0
+
+    hips = [kpts[i][:2] for i in (L_HIP, R_HIP) if kpts[i][2] > HIP_CONF]
+    shoulders = [kpts[i][:2] for i in (L_SHOULDER, R_SHOULDER) if kpts[i][2] > SHOULDER_CONF]
+    hip_mid = np.mean(hips, axis=0) if hips else None
+    sh_mid = np.mean(shoulders, axis=0) if shoulders else None
+
+    # Hips above the shoulders = hallucinated pose: ignore the hips
+    if hip_mid is not None and sh_mid is not None and hip_mid[1] <= sh_mid[1]:
+        hip_mid = None
+
+    if hip_mid is not None and sh_mid is not None:
+        center, torso, src = hip_mid, float(np.linalg.norm(sh_mid - hip_mid)), "KPT"
+    elif hip_mid is not None:
+        center, torso, src = hip_mid, 0.30 * h, "HIP"
+    elif sh_mid is not None:
+        torso = 0.30 * h
+        center, src = np.array([sh_mid[0], sh_mid[1] + torso]), "SHOULDER"
+    else:
+        torso = 0.30 * h
+        center, src = np.array([cx, float(box[1]) + 0.55 * h]), "BOX"
+
+    torso = float(min(max(torso, 0.15 * h), 0.45 * h))
+    return np.asarray(center, dtype=np.float32), torso, src
 
 
-def visible_wrists(kpts: np.ndarray, conf: float = KP_CONF) -> List[np.ndarray]:
-    return [kpts[i][:2] for i in (L_WRIST, R_WRIST) if kpts[i][2] > conf]
+# ----------------------------------------------------------------------------------------------
+# Appearance signature for identity re-linking
+# ----------------------------------------------------------------------------------------------
+def appearance_hist(frame: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
+    """L1-normalised 16x8 Hue/Saturation histogram of the upper body (V ignored: lighting-robust)."""
+    fh, fw = frame.shape[:2]
+    x1, y1 = max(0, int(box[0])), max(0, int(box[1]))
+    x2, y2 = min(fw, int(box[2])), min(fh, int(box[3]))
+    w, h = x2 - x1, y2 - y1
+    if w < 8 or h < 16:
+        return None
+    crop = frame[y1 + int(0.15 * h): y1 + int(0.55 * h), x1 + int(0.15 * w): x2 - int(0.15 * w)]
+    if crop.shape[0] < 4 or crop.shape[1] < 4:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256]).astype(np.float32).flatten()
+    total = float(hist.sum())
+    return hist / total if total > 1e-6 else None
 
 
-def point_to_box_distance(p: np.ndarray, box: np.ndarray) -> float:
-    dx = max(float(box[0] - p[0]), 0.0, float(p[0] - box[2]))
-    dy = max(float(box[1] - p[1]), 0.0, float(p[1] - box[3]))
-    return float(np.hypot(dx, dy))
+def hist_distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    """Bhattacharyya distance in [0, 1]; None when either signature is missing."""
+    if a is None or b is None:
+        return None
+    return float(np.sqrt(max(0.0, 1.0 - float(np.sum(np.sqrt(a * b))))))
 
 
-def shoulder_aspect_ratio(kpts: np.ndarray, torso_h: float) -> Optional[float]:
-    """|L_SHOULDER.x - R_SHOULDER.x| / torso_height. ~0.8 facing/away from camera, -> 0 when side-on."""
-    if kpts[L_SHOULDER][2] > KP_CONF and kpts[R_SHOULDER][2] > KP_CONF:
-        return abs(float(kpts[L_SHOULDER][0] - kpts[R_SHOULDER][0])) / max(torso_h, 1.0)
+# ----------------------------------------------------------------------------------------------
+# Per-customer state
+# ----------------------------------------------------------------------------------------------
+@dataclass
+class Customer:
+    cid: int
+    raw_id: Optional[int] = None
+    present: bool = False
+    first_seen: int = 0
+    last_seen: int = 0
+    box: Optional[np.ndarray] = None
+    center_hist: deque = field(default_factory=lambda: deque(maxlen=8))   # (frame, cx, cy)
+    app_hist: Optional[np.ndarray] = None
+
+    # skeletal analysis
+    waist_rel: Optional[Tuple[float, float, float]] = None   # (off_x/h, off_y/h, torso/h) smoothed
+    waist_src: str = "BOX"
+    wrist_mem: List[Optional[tuple]] = field(default_factory=lambda: [None, None])   # (dx, dy, ok, age)
+    hands: List[np.ndarray] = field(default_factory=list)
+    zone: Optional[Tuple[float, float, float, float]] = None  # pixel rectangle of the waist zone
+    in_zone: bool = False
+    last_reach: int = NEVER
+
+    # dwell + tiers
+    dwell: int = 0
+    gap: int = 0
+    state: str = "BROWSING"
+    warned: bool = False
+    locked: bool = False
+    theft_frame: int = NEVER
+
+    def to_dict(self, fps: float, theft_frames: int = THEFT_FRAMES) -> dict:
+        """Plain dictionary view: {"dwell_time": s, "anomaly_score": f, "state": str, ...}"""
+        return {
+            "dwell_time": round(self.dwell / max(fps, 1.0), 2),
+            "dwell_frames": self.dwell,
+            "anomaly_score": round(min(1.0, self.dwell / float(max(theft_frames, 1))), 3),
+            "state": self.state,
+            "waist_source": self.waist_src,
+            "present": self.present,
+            "raw_track_id": self.raw_id,
+        }
+
+
+def predicted_box(c: Customer, frame_idx: int) -> np.ndarray:
+    """Last box shifted by the customer's recent velocity (bounded extrapolation)."""
+    box = c.box.astype(np.float32).copy()
+    if len(c.center_hist) >= 2:
+        f0, x0, y0 = c.center_hist[0]
+        f1, x1, y1 = c.center_hist[-1]
+        if f1 > f0:
+            vx, vy = (x1 - x0) / (f1 - f0), (y1 - y0) / (f1 - f0)
+            age = min(max(frame_idx - c.last_seen, 0), EXTRAP_MAX_FRAMES)
+            box += np.array([vx * age, vy * age, vx * age, vy * age], dtype=np.float32)
+    return box
+
+
+class CustomerRegistry:
+    """Maps volatile tracker IDs to permanent customer IDs and owns every customer's state."""
+
+    def __init__(self, fps: float, theft_frames: int = THEFT_FRAMES):
+        self.fps = fps if fps and fps > 1 else 20.0
+        self.theft_frames = theft_frames
+        self.customers: Dict[int, Customer] = {}
+        self.raw_to_cid: Dict[int, int] = {}
+        self.cid_to_raw: Dict[int, int] = {}
+        self.pending: Dict[int, dict] = {}
+        self.next_id = 1
+
+    @property
+    def active_customers(self) -> Dict[int, Customer]:
+        return {cid: c for cid, c in self.customers.items() if c.present}
+
+    def snapshot(self, only_active: bool = True) -> Dict[int, dict]:
+        """active_customers-style dictionary: { id: {"dwell_time", "anomaly_score", "state", ...} }"""
+        return {cid: c.to_dict(self.fps, self.theft_frames) for cid, c in self.customers.items()
+                if c.present or not only_active}
+
+    def _link(self, cid: int, raw: int) -> None:
+        old_raw = self.cid_to_raw.get(cid)
+        if old_raw is not None:
+            self.raw_to_cid.pop(old_raw, None)
+        old_cid = self.raw_to_cid.get(raw)
+        if old_cid is not None and old_cid != cid:
+            self.cid_to_raw.pop(old_cid, None)
+        self.raw_to_cid[raw] = cid
+        self.cid_to_raw[cid] = raw
+        self.customers[cid].raw_id = raw
+
+    def _relink_cost(self, frame_idx: int, c: Customer, box: np.ndarray,
+                     hist: Optional[np.ndarray], age: int) -> Optional[float]:
+        pred = predicted_box(c, frame_idx)
+        h_old, h_new = box_height(c.box), box_height(box)
+        if max(h_old, h_new) / min(h_old, h_new) > REID_MAX_SIZE_RATIO:
+            return None
+        dist = float(np.linalg.norm(box_center(pred) - box_center(box))) / max(h_old, h_new)
+        max_d = min(REID_DIST_CAP, REID_BASE_DIST + REID_DIST_GROWTH * age)
+        if dist > max_d:
+            return None
+        app = hist_distance(c.app_hist, hist)
+        if app is not None and app > REID_APP_MAX:
+            return None
+        if app is None and dist > REID_NO_APP_DIST:
+            return None
+        return (0.45 * (1.0 - iou(pred, box))
+                + 0.25 * (dist / max_d)
+                + 0.30 * (app if app is not None else 0.35))
+
+    def _best_relink(self, frame_idx: int, p: dict, assigned: Dict[int, dict]) -> Optional[int]:
+        best, best_cost = None, float("inf")
+        for cid, c in self.customers.items():
+            if cid in assigned or c.box is None:
+                continue
+            age = frame_idx - c.last_seen
+            if age < 1 or age > REID_MAX_LOST_FRAMES:
+                continue
+            cost = self._relink_cost(frame_idx, c, p["box"], p["hist"], age)
+            if cost is not None and cost < best_cost:
+                best, best_cost = cid, cost
+        return best
+
+    @staticmethod
+    def _det_hist(det: dict, frame: np.ndarray) -> Optional[np.ndarray]:
+        if "hist" not in det:
+            det["hist"] = appearance_hist(frame, det["box"])
+        return det["hist"]
+
+    def update(self, frame_idx: int, frame: np.ndarray, dets: List[dict]) -> Dict[int, dict]:
+        """
+        dets: [{"raw_id": int, "box": xyxy, "kpts": (17, 3)}, ...]
+        Returns {customer_id: {"box", "kpts", "raw_id"}} for customers visible in this frame.
+        """
+        assigned: Dict[int, dict] = {}
+        unknown: List[dict] = []
+        for d in dets:
+            cid = self.raw_to_cid.get(d["raw_id"])
+            if cid is not None and cid in self.customers and cid not in assigned:
+                assigned[cid] = d
+            else:
+                unknown.append(d)
+
+        # Unknown raw tracks: confirm after a few frames, then re-link a lost customer or create a new one
+        for d in unknown:
+            p = self.pending.setdefault(d["raw_id"], {"n": 0, "hist": None, "last": frame_idx, "box": d["box"]})
+            p["n"] += 1
+            p["last"] = frame_idx
+            p["box"] = d["box"]
+            h = self._det_hist(d, frame)
+            if h is not None:
+                p["hist"] = h if p["hist"] is None else 0.5 * p["hist"] + 0.5 * h
+        for raw in [r for r, p in self.pending.items() if frame_idx - p["last"] > PENDING_TTL]:
+            del self.pending[raw]
+
+        ready = sorted((d for d in unknown if self.pending[d["raw_id"]]["n"] >= CONFIRM_FRAMES),
+                       key=lambda d: -self.pending[d["raw_id"]]["n"])
+        for d in ready:
+            raw = d["raw_id"]
+            p = self.pending[raw]
+            if any(iou(d["box"], a["box"]) > DUP_IOU for a in assigned.values()):
+                continue                                   # duplicate detection of a known customer
+            cid = self._best_relink(frame_idx, p, assigned)
+            if cid is None:
+                cid = self.next_id
+                self.next_id += 1
+                self.customers[cid] = Customer(cid=cid, first_seen=frame_idx, app_hist=p["hist"])
+                print(f"[NEW CUSTOMER] Customer {cid} (tracker id {raw})")
+            else:
+                print(f"[RE-LINKED] Customer {cid} recovered as tracker id {raw} "
+                      f"after {frame_idx - self.customers[cid].last_seen} frames")
+            self._link(cid, raw)
+            assigned[cid] = d
+            del self.pending[raw]
+
+        # Presence bookkeeping
+        for cid, c in self.customers.items():
+            if cid not in assigned:
+                c.present = False
+        for cid, d in assigned.items():
+            c = self.customers[cid]
+            if frame_idx - c.last_seen > WRIST_GRACE_FRAMES + 1:
+                c.wrist_mem = [None, None]                 # stale short-term memory after a real absence
+            c.present = True
+            c.last_seen = frame_idx
+            c.box = d["box"].copy()
+            ctr = box_center(d["box"])
+            c.center_hist.append((frame_idx, float(ctr[0]), float(ctr[1])))
+            c.raw_id = d["raw_id"]
+
+            # Learn the clothing signature slowly, never while overlapped (would absorb the occluder)
+            overlapped = any(iou(d["box"], o["box"]) > APP_OVERLAP_IOU
+                             for oc, o in assigned.items() if oc != cid)
+            h = self._det_hist(d, frame)
+            if h is not None and not overlapped:
+                c.app_hist = h if c.app_hist is None else (1 - APP_UPDATE_ALPHA) * c.app_hist + APP_UPDATE_ALPHA * h
+
+        return {cid: {"box": d["box"], "kpts": d["kpts"], "raw_id": d["raw_id"]} for cid, d in assigned.items()}
+
+    def expire(self, frame_idx: int) -> None:
+        """Forget customers unseen for too long (confirmed thieves are kept for the whole run)."""
+        for cid in [c for c, s in self.customers.items()
+                    if not s.present and not s.locked and frame_idx - s.last_seen > RETAIN_LOST_FRAMES]:
+            raw = self.cid_to_raw.pop(cid, None)
+            if raw is not None:
+                self.raw_to_cid.pop(raw, None)
+            del self.customers[cid]
+
+
+# ----------------------------------------------------------------------------------------------
+# Skeletal behaviour analysis + two-tier state machine
+# ----------------------------------------------------------------------------------------------
+def analyze_pose(c: Customer, kpts: np.ndarray, box: np.ndarray, frame_idx: int, params: Params) -> bool:
+    """
+    Update the customer's waist estimate, hand positions and reach history.
+    Returns True when at least one hand is in the waist / torso zone in a concealment-like pose.
+    """
+    h = box_height(box)
+    cx_b = (float(box[0]) + float(box[2])) / 2.0
+
+    # 1. Waist estimate with fallbacks, smoothed in box-relative coordinates
+    center, torso, src = estimate_waist(kpts, box)
+    rel = (float(center[0] - cx_b) / h, float(center[1] - float(box[1])) / h, torso / h)
+    if c.waist_rel is None:
+        c.waist_rel = rel
+    else:
+        c.waist_rel = tuple(WAIST_EMA * n + (1.0 - WAIST_EMA) * o for n, o in zip(rel, c.waist_rel))
+    c.waist_src = src
+    waist = np.array([cx_b + c.waist_rel[0] * h, float(box[1]) + c.waist_rel[1] * h], dtype=np.float32)
+    torso = max(c.waist_rel[2] * h, 1.0)
+    c.zone = (float(waist[0] - ZONE_HALF_W * torso), float(waist[1] + ZONE_TOP * torso),
+              float(waist[0] + ZONE_HALF_W * torso), float(waist[1] + ZONE_BOTTOM * torso))
+
+    # 2. Hands (fresh keypoint, or remembered for a few frames when the wrist drops out)
+    any_ok = False
+    hands: List[np.ndarray] = []
+    for k, (w_i, e_i, s_i) in enumerate(ARMS):
+        fresh = kpts[w_i][2] >= WRIST_CONF
+        if fresh:
+            wrist = kpts[w_i][:2].astype(np.float32)
+            dx, dy = float((wrist[0] - waist[0]) / torso), float((wrist[1] - waist[1]) / torso)
+
+            # Arm pose: a straight arm hanging at the side is an idle arm, not a concealment gesture
+            bent: Optional[bool] = None
+            if kpts[e_i][2] >= ELBOW_CONF and kpts[s_i][2] >= ELBOW_CONF:
+                bent = angle_deg(kpts[s_i][:2], kpts[e_i][:2], wrist) < ARM_STRAIGHT_DEG
+
+            in_box = abs(dx) <= ZONE_HALF_W and ZONE_TOP <= dy <= ZONE_BOTTOM
+            ok = in_box and (abs(dx) <= CENTER_DX or bent is True
+                             or (bent is None and abs(dx) <= UNKNOWN_ELBOW_DX))
+            c.wrist_mem[k] = (dx, dy, ok, 0)
+
+            if dy <= REACH_UP or float(np.hypot(dx, dy)) >= REACH_DIST:
+                c.last_reach = frame_idx                    # arm extended toward the shelf
+        else:
+            mem = c.wrist_mem[k]
+            if mem is not None and mem[3] < WRIST_GRACE_FRAMES:
+                dx, dy, ok, age = mem
+                c.wrist_mem[k] = (dx, dy, ok, age + 1)      # occlusion grace: hold the last position
+            else:
+                c.wrist_mem[k] = None
+                continue
+        hands.append(waist + np.array([dx, dy], dtype=np.float32) * torso)
+        any_ok = any_ok or ok
+    c.hands = hands
+    c.in_zone = any_ok
+    return any_ok
+
+
+def advance_state(c: Customer, active: bool, params: Params) -> Optional[str]:
+    """
+    Dwell timer + two-tier state machine. Returns "WARN" the frame a customer becomes SUSPICIOUS,
+    "THEFT" the frame a theft is confirmed, otherwise None.
+    """
+    if active:
+        c.dwell += 1
+        c.gap = 0
+    else:
+        c.gap += 1
+        if c.gap > DWELL_GAP_TOL:
+            c.dwell = max(0, c.dwell - DWELL_DECAY)         # decays, never snaps to zero on a flicker
+
+    if c.locked:
+        c.state = "THEFT"
+        return None
+
+    if c.dwell > params.theft_frames:
+        c.state, c.locked = "THEFT", True
+        return "THEFT"
+    if c.dwell > params.warn_frames:
+        c.state = "SUSPICIOUS"
+        if not c.warned:
+            c.warned = True
+            return "WARN"
+        return None
+    if c.state == "SUSPICIOUS" and c.dwell <= RELEASE_DWELL:
+        c.state, c.warned = "BROWSING", False
     return None
 
 
-# ----------------- Bi-LSTM Anomaly Scorer -----------------
-class AnomalyScorer:
-    """
-    Wraps BiLSTMPoseClassifier. If the model/weights are unavailable it returns no scores and the
-    pipeline runs on the physical (descent + dwell) path alone.
-    """
-
-    def __init__(self, weights_path: Path, device: torch.device):
-        self.device = device
-        self.model = None
-        self._load(weights_path)
-
-    @property
-    def using_model(self) -> bool:
-        return self.model is not None
-
-    def _load(self, weights_path: Path) -> None:
-        try:
-            from models.bilstm_classifier import BiLSTMPoseClassifier
-        except Exception as e:
-            print(f"[WARNING] Could not import BiLSTMPoseClassifier ({e}).")
-            return
-
-        if not weights_path.exists():
-            print(f"[WARNING] Weights not found at '{weights_path}'.")
-            return
-
-        try:
-            model = BiLSTMPoseClassifier()
-            try:
-                ckpt = torch.load(str(weights_path), map_location=self.device, weights_only=True)
-            except TypeError:  # older torch without weights_only
-                ckpt = torch.load(str(weights_path), map_location=self.device)
-
-            if isinstance(ckpt, dict):
-                for key in ("model_state_dict", "state_dict", "model"):
-                    if key in ckpt and isinstance(ckpt[key], dict):
-                        ckpt = ckpt[key]
-                        break
-                ckpt = {(k[7:] if k.startswith("module.") else k): v for k, v in ckpt.items()}
-
-            model.load_state_dict(ckpt)
-            model.to(self.device).eval()
-            self.model = model
-            print(f"[INFO] Bi-LSTM weights loaded: {weights_path}")
-        except Exception as e:
-            self.model = None
-            print(f"[WARNING] Failed to load Bi-LSTM weights ({e}).")
-
-    def score(self, sequences: Dict[int, np.ndarray]) -> Dict[int, float]:
-        if not sequences or self.model is None:
-            return {}
-        ids = list(sequences.keys())
-        batch = torch.from_numpy(np.stack([sequences[t] for t in ids])).float().to(self.device)
-        with torch.inference_mode():
-            out = self.model(batch).reshape(-1).cpu().numpy()
-        out = np.nan_to_num(out, nan=0.0)
-        return {tid: float(s) for tid, s in zip(ids, out)}
+# ----------------------------------------------------------------------------------------------
+# Evidence export + logging
+# ----------------------------------------------------------------------------------------------
+def log_event(evidence_dir: Path, text: str) -> None:
+    line = f"{datetime.now().isoformat(timespec='seconds')}  {text}"
+    try:
+        with open(evidence_dir / "events.log", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as e:
+        print(f"[WARNING] Could not write events.log: {e}")
 
 
-# ----------------- Per-Person State -----------------
-@dataclass
-class PersonState:
-    history: deque = field(default_factory=lambda: deque(maxlen=HISTORY_LEN))
-    last_seen: int = 0
+def export_theft_evidence(frame: np.ndarray, box: np.ndarray, cid: int, dwell: int,
+                          evidence_dir: Path) -> List[Path]:
+    """Full-scene snapshot (suspect boxed) + upscaled suspect crop, saved into evidence/."""
+    saved: List[Path] = []
+    try:
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, int(box[0])), max(0, int(box[1]))
+        x2, y2 = min(fw, int(box[2])), min(fh, int(box[3]))
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Item possession tracking
-    hold_frames: int = 0
-    lost_frames: int = 0                     # consecutive frames with no item at the hand
-    missing_frames: int = 0                  # item gone while armed, NOT counting self-occluded frames
-    rot_occluded_frames: int = 0             # item gone while rotating (treated as self-occlusion)
-    armed: bool = False                      # Verified hold (>= HOLD_MIN_FRAMES) not yet released
-    item_box: Optional[np.ndarray] = None
-    last_item_frame: int = NEVER
+        scene = frame.copy()
+        cv2.rectangle(scene, (x1, y1), (x2, y2), COLOR_RED, 3)
+        cv2.putText(scene, f"THEFT - Customer {cid} (dwell {dwell} frames)", (x1, max(y1 - 10, 22)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, COLOR_RED, 2)
+        scene_path = evidence_dir / f"theft_customer{cid}_{ts}_scene.jpg"
+        if cv2.imwrite(str(scene_path), scene):
+            saved.append(scene_path)
 
-    # Bi-LSTM (EMA-smoothed)
-    score_raw: float = 0.0
-    score: float = 0.0
-    score_valid: bool = False
-
-    # Skeletal rotation
-    sh_ratio: float = 1.0
-    rotating: bool = False
-    rot_grace: int = 0
-
-    # Wrist kinematics / dwell
-    wrist_y: List[deque] = field(
-        default_factory=lambda: [deque(maxlen=DESC_WINDOW), deque(maxlen=DESC_WINDOW)])
-    in_zone: bool = False
-    dwell_valid: bool = False                # a downward entry into the zone has been seen
-    dwell: int = 0
-    dwell_gap: int = 0
-
-    # FSM
-    fsm: str = "BROWSING"
-    physical_ok: bool = False
-    locked: bool = False
-    role: str = "Normal"
-
-    # Handoff / linked suspicion
-    handoff_from: Optional[int] = None
-    handoff_to: Optional[int] = None
-    partner_id: Optional[int] = None
-    partner_frame: int = NEVER
-
-    def update_score(self, raw: float) -> None:
-        self.score_raw = raw
-        if not self.score_valid:
-            self.score = raw
-            self.score_valid = True
-        else:
-            self.score = EMA_ALPHA * raw + (1.0 - EMA_ALPHA) * self.score
+        pad_x, pad_y = int(0.12 * (x2 - x1)), int(0.08 * (y2 - y1))
+        crop = frame[max(0, y1 - pad_y): min(fh, y2 + pad_y), max(0, x1 - pad_x): min(fw, x2 + pad_x)]
+        if crop.shape[0] > 10 and crop.shape[1] > 10:
+            if crop.shape[0] < 400:                          # 2x bicubic upscale for small CCTV crops
+                crop = cv2.resize(crop, (crop.shape[1] * 2, crop.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+            crop_path = evidence_dir / f"theft_customer{cid}_{ts}_suspect.jpg"
+            if cv2.imwrite(str(crop_path), crop):
+                saved.append(crop_path)
+    except Exception as e:                                   # evidence export must never kill the pipeline
+        print(f"[WARNING] Evidence export failure: {e}")
+    return saved
 
 
-@dataclass
-class InteractionTrack:
-    contact: int = 0
-    gap: int = 0
-    start_frame: int = NEVER
-    last_ok: int = NEVER
-    cooldown_until: int = NEVER
-    last_transfer: int = NEVER
-
-
-def reset_dwell(st: PersonState) -> None:
-    st.dwell_valid = False
-    st.dwell = 0
-    st.dwell_gap = 0
-
-
-# ----------------- Kinematics: rotation, downward entry, dwell -----------------
-def update_kinematics(st: PersonState, kpts: np.ndarray, box: np.ndarray, params: Params) -> None:
-    hip_mid, torso = torso_geometry(kpts, box)
-
-    # 1. Skeletal rotation via smoothed shoulder aspect ratio (+ grace period after the turn)
-    ratio = shoulder_aspect_ratio(kpts, torso)
-    if ratio is not None:
-        st.sh_ratio = ROT_EMA * ratio + (1.0 - ROT_EMA) * st.sh_ratio
-    if st.sh_ratio < params.rot_enter:
-        st.rot_grace = ROT_GRACE_FRAMES
-    elif st.sh_ratio >= params.rot_enter + ROT_EXIT_MARGIN:
-        st.rot_grace = max(0, st.rot_grace - 1)
-    st.rotating = st.sh_ratio < params.rot_enter or st.rot_grace > 0
-
-    # 2. Wrist position relative to the hip midpoint (torso units) -> zone membership + downward entry
-    in_zone_any = False
-    descent_event = False
-    for k, idx in enumerate((L_WRIST, R_WRIST)):
-        hist = st.wrist_y[k]
-        if kpts[idx][2] >= ZONE_KP_CONF:
-            y_rel = float((kpts[idx][1] - hip_mid[1]) / torso)
-            x_rel = abs(float(kpts[idx][0] - hip_mid[0])) / torso
-            in_zone = x_rel <= ZONE_HALF_W and ZONE_TOP <= y_rel <= ZONE_BOTTOM
-        else:
-            y_rel, in_zone = None, False
-        hist.append(y_rel)
-
-        if in_zone:
-            in_zone_any = True
-            vals = [v for v in hist if v is not None]
-            recent = [v for v in list(hist)[-4:] if v is not None]
-            if len(vals) >= 3 and len(recent) >= 2:
-                dropped = y_rel - min(vals)                       # image y grows downward => dy > 0
-                not_rising = (recent[-1] - recent[0]) >= -DESC_NO_RISE
-                if dropped >= DESC_MIN_DROP and not_rising:
-                    descent_event = True
-    st.in_zone = in_zone_any
-
-    # 3. Dwell: counts frames in the zone since a DOWNWARD entry. Never advances while rotating.
-    if st.rotating:
-        reset_dwell(st)
-    elif in_zone_any:
-        st.dwell_gap = 0
-        if descent_event and not st.dwell_valid:
-            st.dwell_valid = True
-            st.dwell = 0
-        if st.dwell_valid:
-            st.dwell += 1
-    elif st.dwell_valid:
-        st.dwell_gap += 1
-        if st.dwell_gap > DWELL_GAP_TOL:
-            reset_dwell(st)
-
-
-# ----------------- Detection / Association -----------------
-def detect_items(item_model, frame: np.ndarray, conf: float) -> List[dict]:
-    items: List[dict] = []
-    res = item_model(frame, verbose=False, conf=conf)
-    if not res or res[0].boxes is None:
-        return items
-    fh, fw = frame.shape[:2]
-    for box in res[0].boxes:
-        cls_name = item_model.names[int(box.cls[0].item())]
-        if cls_name not in RETAIL_CLASSES:
-            continue
-        xyxy = box.xyxy[0].cpu().numpy()
-        bw, bh = xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]
-        if bw < fw * 0.25 and bh < fh * 0.35:
-            items.append({"class": cls_name, "box": xyxy})
-    return items
-
-
-def associate_items(items: List[dict], persons: Dict[int, dict]) -> Dict[int, Optional[int]]:
-    """
-    item_near[tid] -> index of the item owned by that person's hand (or None). Each item is owned by
-    at most one person: the one whose wrist is closest to it.
-    """
-    dist: Dict[int, List[float]] = {}
-    thr: Dict[int, float] = {}
-    for tid, p in persons.items():
-        thr[tid] = max(HAND_ITEM_MIN_PX, HAND_ITEM_FRAC * box_height(p["box"]))
-        wrists = visible_wrists(p["kpts"])
-        dist[tid] = [
-            min(point_to_box_distance(w, it["box"]) for w in wrists) if wrists else float("inf")
-            for it in items
-        ]
-
-    item_near: Dict[int, Optional[int]] = {tid: None for tid in persons}
-    best_d: Dict[int, float] = {}
-    for i in range(len(items)):
-        cands = [(dist[tid][i], tid) for tid in persons if dist[tid][i] <= thr[tid]]
-        if not cands:
-            continue
-        d, owner = min(cands)
-        if item_near[owner] is None or d < best_d[owner]:
-            item_near[owner] = i
-            best_d[owner] = d
-    return item_near
-
-
-def update_item_tracking(st: PersonState, item_idx: Optional[int], items: List[dict], frame_idx: int) -> None:
-    if item_idx is not None:
-        st.item_box = items[item_idx]["box"]
-        st.hold_frames += 1
-        st.lost_frames = 0
-        st.missing_frames = 0
-        st.rot_occluded_frames = 0
-        st.last_item_frame = frame_idx
-        reset_dwell(st)                      # item visible again -> any pending concealment is void
-        if st.hold_frames >= HOLD_MIN_FRAMES:
-            st.armed = True
-        return
-
-    st.lost_frames += 1
-    if st.armed:
-        if st.rotating:
-            st.rot_occluded_frames += 1      # self-occlusion: state is held, not escalated
-        else:
-            st.missing_frames += 1
-    elif st.lost_frames > HOLD_GRACE_FRAMES:
-        st.hold_frames = 0
-        st.item_box = None
-
-
-# ----------------- Finite State Machine -----------------
-def evaluate_fsm(st: PersonState, ai_gate: bool) -> bool:
-    """Advance the FSM for one person. Returns True on the frame THEFT is first confirmed."""
-    if st.locked:
-        st.fsm = "THEFT"
-        return False
-
-    item_gone = st.armed and st.missing_frames >= MISSING_MIN_FRAMES
-    st.physical_ok = (
-        item_gone
-        and not st.rotating
-        and st.dwell_valid
-        and st.dwell >= DWELL_FRAMES
-    )
-    ai_ok = (not ai_gate) or (st.score_valid and st.score > AI_THEFT_SCORE)
-
-    # Item gone for a very long time with no concealment -> put down / lost by the detector
-    if st.armed and st.missing_frames >= RELEASE_MISSING_FRAMES and not st.physical_ok:
-        st.armed = False
-        st.hold_frames = 0
-        st.missing_frames = 0
-        st.item_box = None
-        reset_dwell(st)
-
-    if st.physical_ok and ai_ok:
-        st.fsm = "THEFT"
-        return True
-    if st.physical_ok:
-        st.fsm = "SUSPICIOUS"
-    elif st.armed:
-        st.fsm = "HOLDING"
-    else:
-        st.fsm = "BROWSING"
-    return False
-
-
-def lock_theft(tid: int, states: Dict[int, PersonState], recorder: IncidentRecorder,
-               rolling_buffer, frame_idx: int) -> None:
-    st = states[tid]
-    st.locked = True
-    st.fsm = "THEFT"
-    st.role = "PRIMARY THIEF: Concealment"
-    recorder.start(rolling_buffer)
-    recorder.add_suspect(tid)
-    print(f"\n[THEFT CONFIRMED] ID {tid} (smoothed Bi-LSTM {st.score:.2f}, dwell {st.dwell} frames)")
-
-    # Linked suspicion: whoever interacted closely with the concealer while an item was held.
-    pid = st.partner_id
-    if (pid is not None and pid in states and not states[pid].locked
-            and frame_idx - st.partner_frame <= INTERACTION_LINK_FRAMES):
-        acc = states[pid]
-        acc.locked = True
-        acc.fsm = "THEFT"
-        acc.role = "ACCOMPLICE: Handoff"
-        recorder.add_suspect(pid)
-        print(f"[ACCOMPLICE CONFIRMED] ID {pid} (close interaction with ID {tid})")
-
-
-# ----------------- Proximity Handoff + Linked Suspicion -----------------
-def wrists_within(kpts_a: np.ndarray, kpts_b: np.ndarray, max_dist: float) -> bool:
-    wa = visible_wrists(kpts_a, ZONE_KP_CONF)
-    wb = visible_wrists(kpts_b, ZONE_KP_CONF)
-    return any(float(np.linalg.norm(a - b)) <= max_dist for a in wa for b in wb)
-
-
-def try_transfer(frame_idx: int, giver_id: int, taker_id: int, states: Dict[int, PersonState],
-                 tr: InteractionTrack, handoff_log: list) -> bool:
-    """Move the hold from giver to taker if the giver just lost the item during a close contact."""
-    g, t = states[giver_id], states[taker_id]
-    if g.locked or t.locked or not g.armed:
-        return False
-    if g.lost_frames < HANDOFF_LOST_MIN_FRAMES:
-        return False                                        # giver still visibly holds it
-    if g.last_item_frame < tr.start_frame - HANDOFF_PRE_MARGIN:
-        return False                                        # item vanished long before this contact
-    if g.last_item_frame <= tr.last_transfer:
-        return False                                        # item not seen since the last transfer: no ping-pong
-
-    # Immediate transfer of the hold to the taker (the pass itself is usually hidden by the hands)
-    already_visible = t.armed and t.lost_frames == 0
-    t.armed = True
-    t.hold_frames = max(t.hold_frames, HOLD_MIN_FRAMES)
-    if not already_visible:
-        t.lost_frames = g.lost_frames
-        t.missing_frames = 0
-        t.rot_occluded_frames = 0
-        t.item_box = g.item_box
-        t.last_item_frame = g.last_item_frame
-    reset_dwell(t)                                          # concealment must come AFTER the transfer
-    t.handoff_from = giver_id
-
-    g.armed = False
-    g.hold_frames = 0
-    g.missing_frames = 0
-    g.rot_occluded_frames = 0
-    g.item_box = None
-    reset_dwell(g)
-    g.handoff_to = taker_id
-
-    for a, b, when in ((g, taker_id, frame_idx), (t, giver_id, frame_idx)):
-        a.partner_id, a.partner_frame = b, when
-
-    tr.cooldown_until = frame_idx + HANDOFF_COOLDOWN
-    tr.last_transfer = frame_idx
-    tr.last_ok = NEVER
-    tr.contact = 0            # a new transfer needs fresh contact AND an item seen after it began
-    tr.gap = 0
-    handoff_log.append((giver_id, taker_id, frame_idx))
-    print(f"\n[HANDOFF] ID {giver_id} -> ID {taker_id} (proximity transfer, item hidden by hands)")
-    return True
-
-
-def process_interactions(frame_idx: int, persons: Dict[int, dict], states: Dict[int, PersonState],
-                         tracks: Dict[Tuple[int, int], InteractionTrack], params: Params,
-                         handoff_log: list) -> None:
-    ids = sorted(persons.keys())
-    for i, a_id in enumerate(ids):
-        for b_id in ids[i + 1:]:
-            sa, sb = states[a_id], states[b_id]
-            tr = tracks.setdefault((a_id, b_id), InteractionTrack())
-
-            relevant = (sa.armed and not sa.locked) or (sb.armed and not sb.locked)
-            close = relevant and wrists_within(persons[a_id]["kpts"], persons[b_id]["kpts"], params.prox_px)
-
-            if close:
-                if tr.contact == 0:
-                    tr.start_frame = frame_idx
-                tr.contact += 1
-                tr.gap = 0
-            else:
-                tr.gap += 1
-                if tr.gap > HANDOFF_CONTACT_GAP_TOL:
-                    tr.contact = 0
-
-            if tr.contact >= HANDOFF_CONTACT_FRAMES:
-                tr.last_ok = frame_idx
-                # Linked suspicion: remember who interacted with whom while an item was held
-                sa.partner_id, sa.partner_frame = b_id, frame_idx
-                sb.partner_id, sb.partner_frame = a_id, frame_idx
-
-            if frame_idx < tr.cooldown_until or frame_idx - tr.last_ok > HANDOFF_WINDOW:
-                continue
-            if not try_transfer(frame_idx, a_id, b_id, states, tr, handoff_log):
-                try_transfer(frame_idx, b_id, a_id, states, tr, handoff_log)
-
-    # Drop stale tracks (a person left the scene)
-    for key in [k for k in tracks if k[0] not in persons or k[1] not in persons]:
-        del tracks[key]
-
-
-# ----------------- HUD -----------------
-def draw_person(annotated: np.ndarray, tid: int, pdata: dict, st: PersonState, debug: bool) -> None:
+# ----------------------------------------------------------------------------------------------
+# HUD
+# ----------------------------------------------------------------------------------------------
+def draw_customer(img: np.ndarray, cid: int, pdata: dict, c: Customer, params: Params, frame_idx: int) -> None:
     box = pdata["box"].astype(int)
     kpts = pdata["kpts"]
-    color, text = FSM_STYLE[st.fsm]
+    color = STATE_COLOR[c.state]
 
-    cv2.rectangle(annotated, (box[0], box[1]), (box[2], box[3]), color, 2)
+    cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), color, 2)
+    for a, b in SKELETON:                                    # skeleton overlay
+        if kpts[a][2] > 0.3 and kpts[b][2] > 0.3:
+            cv2.line(img, tuple(kpts[a][:2].astype(int)), tuple(kpts[b][:2].astype(int)), color, 2)
+    for i in range(17):
+        if kpts[i][2] > 0.3:
+            cv2.circle(img, tuple(kpts[i][:2].astype(int)), 3, (255, 255, 255), -1)
 
-    for pa, pb in TORSO_PAIRS:
-        if kpts[pa][2] > 0.3 and kpts[pb][2] > 0.3:
-            cv2.line(annotated, tuple(kpts[pa][:2].astype(int)), tuple(kpts[pb][:2].astype(int)), color, 2)
+    if c.zone is not None:                                   # waist / torso zone
+        cv2.rectangle(img, (int(c.zone[0]), int(c.zone[1])), (int(c.zone[2]), int(c.zone[3])),
+                      COLOR_MAGENTA, 2 if c.in_zone else 1)
+    for hpt in c.hands:
+        cv2.circle(img, (int(hpt[0]), int(hpt[1])), 5, COLOR_MAGENTA, -1)
 
-    if st.armed and st.item_box is not None and st.lost_frames <= HOLD_GRACE_FRAMES and not st.locked:
-        ib = st.item_box.astype(int)
-        cv2.rectangle(annotated, (ib[0], ib[1]), (ib[2], ib[3]), (255, 255, 0), 1)
-
-    if st.fsm == "THEFT":
-        label = f"ID: {tid} | 100% THEFT: {st.role}"
-    else:
-        label = f"ID: {tid} | Status: {text}"
-        if st.armed and st.rotating and st.lost_frames > 0:
-            label += " (turning: self-occluded)"
-        if st.handoff_to is not None:
-            label += f" | gave item to {st.handoff_to}"
-        if st.handoff_from is not None:
-            label += f" | got item from {st.handoff_from}"
-    if st.score_valid:
-        label += f" | AI {st.score:.2f}"
-
-    vertical_offset = 25 if (tid % 2 == 0) else 45
-    label_y = max(box[1] - 10, vertical_offset)
-    cv2.putText(annotated, label, (box[0], label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-    if debug:
-        hip_mid, torso = torso_geometry(kpts, pdata["box"])
-        zx1 = int(hip_mid[0] - ZONE_HALF_W * torso)
-        zx2 = int(hip_mid[0] + ZONE_HALF_W * torso)
-        zy1 = int(hip_mid[1] + ZONE_TOP * torso)
-        zy2 = int(hip_mid[1] + ZONE_BOTTOM * torso)
-        cv2.rectangle(annotated, (zx1, zy1), (zx2, zy2), (255, 0, 255), 1)
-        dbg = (f"hold:{st.hold_frames} miss:{st.missing_frames} rotocc:{st.rot_occluded_frames} "
-               f"dwell:{st.dwell}/{DWELL_FRAMES}{'*' if st.dwell_valid else ''} "
-               f"sh:{st.sh_ratio:.2f}{' ROT' if st.rotating else ''} zone:{int(st.in_zone)}")
-        cv2.putText(annotated, dbg, (box[0], min(box[3] + 18, annotated.shape[0] - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    label = f"Cust {cid} | {c.state} | {c.dwell}/{params.theft_frames}"
+    cv2.putText(img, label, (box[0], max(box[1] - 10, 22 if cid % 2 == 0 else 42)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+    engaged = "Y" if frame_idx - c.last_reach <= ENGAGE_WINDOW else "N"
+    cv2.putText(img, f"{c.waist_src} z{int(c.in_zone)} r{engaged} t{c.raw_id}",
+                (box[0], min(box[3] + 18, img.shape[0] - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
 
-# ----------------- Main Pipeline -----------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=str, default="")
-    parser.add_argument("--conf", type=float, default=0.35, help="Item detector confidence")
-    parser.add_argument("--pose-model", type=str, default="yolov8n-pose.pt")
-    parser.add_argument("--item-model", type=str, default="yolov8n.pt")
-    parser.add_argument("--weights", type=str, default="models/best_bilstm.pth")
-    parser.add_argument("--norm", type=str, default="box", choices=NORM_MODES,
-                        help="Keypoint normalization fed to the Bi-LSTM (must match training)")
-    parser.add_argument("--rot-enter", type=float, default=ROT_ENTER,
-                        help="Shoulder aspect ratio below which the person counts as rotating")
-    parser.add_argument("--prox-px", type=float, default=HANDOFF_PROX_PX,
-                        help="Wrist-to-wrist distance (pixels) for a proximity handoff")
-    parser.add_argument("--no-ai-gate", action="store_true",
-                        help="Debug: confirm theft on the physical dwell alone (ignore the Bi-LSTM score)")
-    parser.add_argument("--item-stride", type=int, default=2, help="Run item detector every N frames")
-    parser.add_argument("--no-show", action="store_true", help="Disable the preview window")
-    parser.add_argument("--debug", action="store_true", help="Draw waist zone and FSM counters")
-    args = parser.parse_args()
+def draw_panel(img: np.ndarray, snapshot: Dict[int, dict]) -> None:
+    y = 18
+    for cid, d in sorted(snapshot.items()):
+        cv2.putText(img, f"C{cid}: {d['state']:<10} dwell {d['dwell_time']:.1f}s ({d['dwell_frames']}f)",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        y += 16
+
+
+# ----------------------------------------------------------------------------------------------
+# Tracker config
+# ----------------------------------------------------------------------------------------------
+def ensure_tracker_yaml(kind: str) -> str:
+    """Write the tracker config next to this script and return its path (rewritten every run)."""
+    out_dir = SCRIPT_DIR / "trackers"
+    out_dir.mkdir(exist_ok=True)
+    path = out_dir / f"{kind}_retail.yaml"
+    lines = [f"# Auto-generated by run_inference.py ({kind}; long buffer for occlusions)"]
+    for key, val in TRACKER_CFGS[kind].items():
+        lines.append(f"{key}: {str(val).lower() if isinstance(val, bool) else val}")
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+# ----------------------------------------------------------------------------------------------
+# Main pipeline
+# ----------------------------------------------------------------------------------------------
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Two-tier CCTV shoplifting detection (pose + dwell)")
+    parser.add_argument("--source", type=str, default="", help="Video file path or camera index")
+    parser.add_argument("--model", type=str, default="yolov8n-pose.pt")
+    parser.add_argument("--conf", type=float, default=0.25, help="Person detection confidence")
+    parser.add_argument("--imgsz", type=int, default=0, help="Inference size (0 = model default)")
+    parser.add_argument("--tracker", type=str, default="bytetrack", choices=sorted(TRACKER_CFGS.keys()))
+    parser.add_argument("--tracker-cfg", type=str, default="", help="Custom tracker YAML (overrides the default)")
+    parser.add_argument("--warn-frames", type=int, default=WARN_FRAMES, help="Tier 1: dwell frames -> SUSPICIOUS")
+    parser.add_argument("--theft-frames", type=int, default=THEFT_FRAMES, help="Tier 2: dwell frames -> THEFT")
+    parser.add_argument("--no-reach-gate", action="store_true",
+                        help="Count waist dwell even without a preceding reach toward the shelf")
+    parser.add_argument("--evidence-dir", type=str, default="evidence")
+    parser.add_argument("--debug", action="store_true",
+                        help="Open the HUD preview (boxes, skeletons, states, dwell counters, waist zone)")
+    args = parser.parse_args(argv)
+
+    if args.theft_frames <= args.warn_frames:
+        parser.error("--theft-frames must be larger than --warn-frames")
+    params = Params(warn_frames=args.warn_frames, theft_frames=args.theft_frames,
+                    reach_gate=not args.no_reach_gate)
 
     video_source = args.source
     if not video_source:
-        local_vids = list(Path(".").glob("*.mp4"))
-        if local_vids:
-            video_source = str(local_vids[0])
-            print(f"Auto-selected video source: {video_source}")
-        else:
-            raise FileNotFoundError("No input video file found in current directory.")
-    if video_source.isdigit():
+        local_vids = sorted(Path(".").glob("*.mp4"))
+        if not local_vids:
+            raise FileNotFoundError("No --source given and no .mp4 found in the current directory.")
+        video_source = str(local_vids[0])
+        print(f"Auto-selected video source: {video_source}")
+    if str(video_source).isdigit():
         video_source = int(video_source)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pose_model = YOLO(args.pose_model)
-    item_model = YOLO(args.item_model)
-
-    weights_path = Path(args.weights)
-    if not weights_path.is_absolute() and not weights_path.exists():
-        weights_path = SCRIPT_DIR / weights_path
-    scorer = AnomalyScorer(weights_path, device)
-
-    ai_gate = scorer.using_model and not args.no_ai_gate
-    if not scorer.using_model:
-        print("[WARNING] No Bi-LSTM available: AI gate disabled, theft is confirmed on the physical dwell alone.")
-    elif args.no_ai_gate:
-        print("[INFO] --no-ai-gate: theft is confirmed on the physical dwell alone.")
-    params = Params(rot_enter=args.rot_enter, prox_px=args.prox_px, ai_gate=ai_gate)
+    model = YOLO(args.model)
+    tracker_cfg = args.tracker_cfg or ensure_tracker_yaml(args.tracker)
+    track_kwargs = dict(persist=True, tracker=tracker_cfg, verbose=False, conf=args.conf)
+    if args.imgsz > 0:
+        track_kwargs["imgsz"] = args.imgsz
+    print(f"[INFO] Tracker: {args.tracker} ({tracker_cfg})")
 
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source: {video_source}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
-    evidence_dir = Path("evidence")
-    evidence_dir.mkdir(exist_ok=True)
+    evidence_dir = Path(args.evidence_dir)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    person_states: Dict[int, PersonState] = {}
-    interaction_tracks: Dict[Tuple[int, int], InteractionTrack] = {}
-    handoff_log: List[Tuple[int, int, int]] = []
-    rolling_buffer = deque(maxlen=PRE_ROLL_FRAMES)  # ~3 seconds pre-roll
-    recorder = IncidentRecorder(evidence_dir, fps)
-
-    detected_items: List[dict] = []
+    registry = CustomerRegistry(fps, params.theft_frames)
+    show = args.debug
+    if show and sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # OpenCV's Qt backend aborts the whole process (no Python exception) when there is no display
+        print("[WARNING] --debug requested but no display is available; running headless.")
+        show = False
     frame_idx = 0
-    if ai_gate:
-        scorer_tag = f"Bi-LSTM[{args.norm}] EMA>{AI_THEFT_SCORE:.2f} + dwell"
-    elif scorer.using_model:
-        scorer_tag = f"Bi-LSTM[{args.norm}] (gate OFF) dwell only"
-    else:
-        scorer_tag = "Dwell only (no weights)"
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         frame_idx += 1
-        frame_h, frame_w = frame.shape[:2]
-        annotated_frame = frame.copy()
-        rolling_buffer.append(frame.copy())
-        recorder.feed(frame)
 
-        # 1. Track persons via pose (ByteTrack); update keypoint history, rotation, wrist kinematics
-        pose_res = pose_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
-        current_persons: Dict[int, dict] = {}
+        # 1. Detect + track people (pose model + ByteTrack / BoT-SORT)
+        res = model.track(frame, **track_kwargs)
+        dets: List[dict] = []
+        if (res and res[0].boxes is not None and res[0].boxes.id is not None
+                and res[0].keypoints is not None):
+            boxes = res[0].boxes.xyxy.cpu().numpy()
+            raw_ids = res[0].boxes.id.int().cpu().numpy()
+            keypoints = res[0].keypoints.data.cpu().numpy()
+            for b, raw, k in zip(boxes, raw_ids, keypoints):
+                dets.append({"raw_id": int(raw), "box": b, "kpts": k})
 
-        if (pose_res and pose_res[0].boxes is not None and pose_res[0].boxes.id is not None
-                and pose_res[0].keypoints is not None):
-            boxes = pose_res[0].boxes.xyxy.cpu().numpy()
-            track_ids = pose_res[0].boxes.id.int().cpu().numpy()
-            keypoints = pose_res[0].keypoints.data.cpu().numpy()
+        # 2. Stable customer IDs
+        persons = registry.update(frame_idx, frame, dets)
 
-            for b_xyxy, raw_tid, kpts in zip(boxes, track_ids, keypoints):
-                tid = int(raw_tid)
-                current_persons[tid] = {"box": b_xyxy, "kpts": kpts}
-                st = person_states.setdefault(tid, PersonState())
-                st.last_seen = frame_idx
-                st.history.append(normalize_keypoints(kpts, b_xyxy, (frame_w, frame_h), args.norm))
-                if not st.locked:
-                    update_kinematics(st, kpts, b_xyxy, params)
+        # 3. Per-customer skeletal analysis, dwell timer and tier transitions
+        for cid, p in persons.items():
+            c = registry.customers[cid]
+            in_zone = analyze_pose(c, p["kpts"], p["box"], frame_idx, params)
+            engaged = (not params.reach_gate) or (frame_idx - c.last_reach <= ENGAGE_WINDOW)
+            event = advance_state(c, in_zone and engaged, params)
 
-        # 2. Detect retail merchandise (cached between detector runs)
-        if (frame_idx - 1) % max(1, args.item_stride) == 0:
-            detected_items = detect_items(item_model, frame, args.conf)
+            if event == "WARN":                                              # Tier 1
+                msg = (f"[WARNING] Customer {cid} SUSPICIOUS: hands at waist/torso for {c.dwell} frames "
+                       f"({c.dwell / fps:.1f}s) [waist source: {c.waist_src}]")
+                print(msg)
+                log_event(evidence_dir, msg)
+            elif event == "THEFT":                                           # Tier 2
+                c.theft_frame = frame_idx
+                msg = (f"[THEFT ALERT] Customer {cid} CONFIRMED THEFT: sustained concealment gesture, "
+                       f"dwell {c.dwell} frames ({c.dwell / fps:.1f}s)")
+                print("\n" + "=" * 78 + f"\n{msg}\n" + "=" * 78)
+                log_event(evidence_dir, msg)
+                for path in export_theft_evidence(frame, p["box"], cid, c.dwell, evidence_dir):
+                    print(f"[EVIDENCE] saved {path}")
+                    log_event(evidence_dir, f"evidence saved: {path}")
 
-        # 3. Associate items to wrists and update possession counters (rotation-aware)
-        item_near = associate_items(detected_items, current_persons)
-        for tid in current_persons:
-            st = person_states[tid]
-            if st.locked:
-                continue
-            update_item_tracking(st, item_near.get(tid), detected_items, frame_idx)
+        registry.expire(frame_idx)
 
-        # 4. Proximity handoff + linked-suspicion bookkeeping
-        process_interactions(frame_idx, current_persons, person_states, interaction_tracks,
-                             params, handoff_log)
-
-        # 5. Bi-LSTM anomaly scoring (batched, every SCORE_STRIDE frames) with EMA smoothing
-        if scorer.using_model and frame_idx % SCORE_STRIDE == 0:
-            sequences = {
-                tid: np.stack(person_states[tid].history)
-                for tid in current_persons
-                if len(person_states[tid].history) == HISTORY_LEN
-            }
-            for tid, s in scorer.score(sequences).items():
-                person_states[tid].update_score(s)
-
-        # 6. FSM evaluation + theft lock (+ accomplice linking)
-        for tid in current_persons:
-            if evaluate_fsm(person_states[tid], ai_gate):
-                lock_theft(tid, person_states, recorder, rolling_buffer, frame_idx)
-
-        # 7. Evidence capture (best-frame tracker + finalize)
-        recorder.update(frame, current_persons, person_states)
-
-        # 8. Stale state cleanup
-        for tid in [t for t, s in person_states.items() if frame_idx - s.last_seen > STATE_TTL_FRAMES]:
-            if not person_states[tid].locked:
-                del person_states[tid]
-
-        # 9. HUD rendering
-        for tid, pdata in current_persons.items():
-            draw_person(annotated_frame, tid, pdata, person_states[tid], args.debug)
-        cv2.putText(annotated_frame, f"Scorer: {scorer_tag}", (10, annotated_frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-        if not args.no_show:
-            cv2.imshow("AI CCTV Shoplifting Prevention", annotated_frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-    # Flush an in-progress incident if the video ended during post-roll
-    recorder.finish()
+        # 4. HUD preview
+        if show:
+            hud = frame.copy()
+            for cid, p in persons.items():
+                draw_customer(hud, cid, p, registry.customers[cid], params, frame_idx)
+            draw_panel(hud, registry.snapshot(only_active=True))
+            try:
+                cv2.imshow("AI CCTV Shoplifting Detection", hud)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            except cv2.error as e:
+                print(f"[WARNING] HUD preview unavailable ({e}); continuing headless.")
+                show = False
 
     cap.release()
-    cv2.destroyAllWindows()
-    # Give background writer threads a moment to flush before interpreter exit
-    for t in threading.enumerate():
-        if t is not threading.current_thread() and t.daemon:
-            t.join(timeout=10.0)
+    if args.debug:
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+
+    print("\n[FINAL CUSTOMER STATES]")
+    for cid, d in registry.snapshot(only_active=False).items():
+        print(f"  Customer {cid}: {d}")
 
 
 if __name__ == "__main__":
