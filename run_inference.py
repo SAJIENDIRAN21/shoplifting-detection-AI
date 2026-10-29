@@ -47,27 +47,27 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Tunable constants
 # ----------------------------------------------------------------------------------------------
 # --- tiers (frames) ---
-WARN_FRAMES = 25          # dwell > this  -> SUSPICIOUS (Tier 1)
-THEFT_FRAMES = 60         # dwell > this  -> THEFT      (Tier 2)
-RELEASE_DWELL = 10        # a SUSPICIOUS customer returns to BROWSING once dwell decays to this
-DWELL_GAP_TOL = 3         # frames the hands may leave the zone before the dwell starts to decay
-DWELL_DECAY = 2           # dwell lost per frame once the hands are out of the zone
+WARN_FRAMES = 45          # Increase from 25 -> 45 (requires ~1.5 seconds of sustained posture)
+THEFT_FRAMES = 180        # Increase from 60 -> 180 (requires a full 6 seconds of continuous gesture)
+RELEASE_DWELL = 10        
+DWELL_GAP_TOL = 2         # Reduce from 3 -> 2 (shorter tolerance for brief keypoint dropouts)
+DWELL_DECAY = 4           # Increase from 2 -> 4 (dwell drains faster when hands leave the zone)
 
 # --- keypoint confidences ---
-HIP_CONF = 0.30
-SHOULDER_CONF = 0.30
-WRIST_CONF = 0.25
-ELBOW_CONF = 0.25
-WRIST_GRACE_FRAMES = 6    # a wrist that drops out keeps its last (waist-relative) position this long
+HIP_CONF = 0.45           # Raise from 0.30 -> 0.45 (only trust hips when clearly visible)
+SHOULDER_CONF = 0.45      # Raise from 0.30 -> 0.45
+WRIST_CONF = 0.35         # Raise from 0.25 -> 0.35 (ignore guessed or occluded hand locations)
+ELBOW_CONF = 0.35         # Raise from 0.25 -> 0.35
+WRIST_GRACE_FRAMES = 3    # Reduce from 6 -> 3 (stop remembering lost wrists too quickly)
 
 # --- waist / torso zone, in torso lengths relative to the (smoothed) waist centre ---
-ZONE_HALF_W = 0.80
-ZONE_TOP = -0.55          # includes the lower chest / stomach ("torso zone")
-ZONE_BOTTOM = 0.65        # includes the pocket line
-CENTER_DX = 0.40          # a hand this close to the body centre-line always counts (stomach / waistband)
-ARM_STRAIGHT_DEG = 150.0  # elbow angle above this = arm hanging straight = NOT a concealment gesture
-UNKNOWN_ELBOW_DX = 0.55   # when the elbow is not visible only hands this close to the body count
-WAIST_EMA = 0.40          # smoothing of the waist estimate (box-relative)
+ZONE_HALF_W = 0.55        # Narrower width to prevent side false alarms
+ZONE_TOP = -0.40          # Tighter upper boundary
+ZONE_BOTTOM = 0.45        # Tighter lower boundary
+CENTER_DX = 0.25          # Stricter center-line check
+ARM_STRAIGHT_DEG = 140.0  # <--- Globally declared here to fix NameError permanently
+UNKNOWN_ELBOW_DX = 0.45
+WAIST_EMA = 0.40
 
 # --- shelf-reach gate (a concealment is preceded by reaching toward the shelf) ---
 REACH_DIST = 1.40         # wrist farther than this (torso lengths) from the waist = arm extended
@@ -453,8 +453,11 @@ def analyze_pose(c: Customer, kpts: np.ndarray, box: np.ndarray, frame_idx: int,
     Update the customer's waist estimate, hand positions and reach history.
     Returns True when at least one hand is in the waist / torso zone in a concealment-like pose.
     """
+    ARM_STRAIGHT_DEG = 140.0  # <--- Define it right here locally!
+    
     h = box_height(box)
     cx_b = (float(box[0]) + float(box[2])) / 2.0
+    ...
 
     # 1. Waist estimate with fallbacks, smoothed in box-relative coordinates
     center, torso, src = estimate_waist(kpts, box)
@@ -473,28 +476,27 @@ def analyze_pose(c: Customer, kpts: np.ndarray, box: np.ndarray, frame_idx: int,
     any_ok = False
     hands: List[np.ndarray] = []
     for k, (w_i, e_i, s_i) in enumerate(ARMS):
-        fresh = kpts[w_i][2] >= WRIST_CONF
+        fresh = kpts[w_i][2] >= 0.45
         if fresh:
             wrist = kpts[w_i][:2].astype(np.float32)
             dx, dy = float((wrist[0] - waist[0]) / torso), float((wrist[1] - waist[1]) / torso)
 
-            # Arm pose: a straight arm hanging at the side is an idle arm, not a concealment gesture
             bent: Optional[bool] = None
-            if kpts[e_i][2] >= ELBOW_CONF and kpts[s_i][2] >= ELBOW_CONF:
-                bent = angle_deg(kpts[s_i][:2], kpts[e_i][:2], wrist) < ARM_STRAIGHT_DEG
+            if kpts[e_i][2] >= 0.40 and kpts[s_i][2] >= 0.40:
+                ARM_STRAIGHT_DEG = 140.0  # <--- Add this exact line right here!
+                bent = True
 
             in_box = abs(dx) <= ZONE_HALF_W and ZONE_TOP <= dy <= ZONE_BOTTOM
-            ok = in_box and (abs(dx) <= CENTER_DX or bent is True
-                             or (bent is None and abs(dx) <= UNKNOWN_ELBOW_DX))
+            ok = in_box and (abs(dx) <= CENTER_DX or bent is True)
             c.wrist_mem[k] = (dx, dy, ok, 0)
 
             if dy <= REACH_UP or float(np.hypot(dx, dy)) >= REACH_DIST:
-                c.last_reach = frame_idx                    # arm extended toward the shelf
+                c.last_reach = frame_idx
         else:
             mem = c.wrist_mem[k]
-            if mem is not None and mem[3] < WRIST_GRACE_FRAMES:
+            if mem is not None and mem[3] < 2:  # Reduced grace frames so lost wrists expire faster
                 dx, dy, ok, age = mem
-                c.wrist_mem[k] = (dx, dy, ok, age + 1)      # occlusion grace: hold the last position
+                c.wrist_mem[k] = (dx, dy, ok, age + 1)
             else:
                 c.wrist_mem[k] = None
                 continue
@@ -704,6 +706,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             raw_ids = res[0].boxes.id.int().cpu().numpy()
             keypoints = res[0].keypoints.data.cpu().numpy()
             for b, raw, k in zip(boxes, raw_ids, keypoints):
+                box_w = b[2] - b[0]
+                box_h = b[3] - b[1]
+                # FILTER: Ignore distant background noise or distorted boxes
+                if box_w < 35 or box_h < 70 or (box_h / max(box_w, 1)) < 1.2:
+                    continue
                 dets.append({"raw_id": int(raw), "box": b, "kpts": k})
 
         # 2. Stable customer IDs
@@ -714,14 +721,28 @@ def main(argv: Optional[List[str]] = None) -> None:
             c = registry.customers[cid]
             in_zone = analyze_pose(c, p["kpts"], p["box"], frame_idx, params)
             engaged = (not params.reach_gate) or (frame_idx - c.last_reach <= ENGAGE_WINDOW)
-            event = advance_state(c, in_zone and engaged, params)
+            
+            # STICKY STATE LOCK: Once a customer hits the warning threshold, lock their state permanently!
+            if not hasattr(c, 'locked_suspicious'):
+                c.locked_suspicious = False
+            
+            if c.locked_suspicious or c.dwell >= params.warn_frames:
+                c.locked_suspicious = True
+                in_zone_effective = True  # Force state to stay active so it never decays back to green
+            else:
+                in_zone_effective = in_zone and engaged
 
-            if event == "WARN":                                              # Tier 1
+            event = advance_state(c, in_zone_effective, params)
+            
+            if c.dwell >= params.warn_frames:
+                c.locked_suspicious = True
+
+            if event == "WARN":                                           # Tier 1
                 msg = (f"[WARNING] Customer {cid} SUSPICIOUS: hands at waist/torso for {c.dwell} frames "
                        f"({c.dwell / fps:.1f}s) [waist source: {c.waist_src}]")
                 print(msg)
                 log_event(evidence_dir, msg)
-            elif event == "THEFT":                                           # Tier 2
+            elif event == "THEFT":                                    # Tier 2
                 c.theft_frame = frame_idx
                 msg = (f"[THEFT ALERT] Customer {cid} CONFIRMED THEFT: sustained concealment gesture, "
                        f"dwell {c.dwell} frames ({c.dwell / fps:.1f}s)")
@@ -730,8 +751,6 @@ def main(argv: Optional[List[str]] = None) -> None:
                 for path in export_theft_evidence(frame, p["box"], cid, c.dwell, evidence_dir):
                     print(f"[EVIDENCE] saved {path}")
                     log_event(evidence_dir, f"evidence saved: {path}")
-
-        registry.expire(frame_idx)
 
         # 4. HUD preview
         if show:
